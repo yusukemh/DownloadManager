@@ -4,15 +4,14 @@ from pathlib import Path
 import os, itertools, time, urllib, logging, base64
 from http.cookiejar import CookieJar
 from abc import abstractmethod
-import numpy as np
-import pandas as pd, calendar
-import warnings
+from .file_metadata import FileMetadata
+import pandas as pd
 
 # NimbusAI sdk packages
 from nimbus.common.io import init_logging
 from nimbus.common.tools import param_constraints
 from nimbus.common.exception import MaximumTrialExceededError, IncompleteDownloadError, get_exception_text
-from nimbus.common.file_metadata import FileMetadata
+# from nimbus.common.file_metadata import FileMetadata
 import nimbus.common.sql as sql
 
 class DownloadManager():
@@ -113,6 +112,7 @@ class DownloadManager():
         dne = [not sql.exists(db_filename=d_filename, table='file', attr='source_filename', val=s_filename)\
                 for (d_filename, s_filename) in zip(database_filenames, source_filenames)]
         source_filenames = list(itertools.compress(source_filenames, dne))
+        buffer_filenames = list(itertools.compress(buffer_filenames, dne))
         local_filenames = list(itertools.compress(local_filenames, dne))
         database_filenames = list(itertools.compress(database_filenames, dne))
 
@@ -166,7 +166,6 @@ class DownloadManager():
                 else:
                     ret.append(f"{relative_to}/{p}")
             return ret
-
                 
         if start >= end: raise ValueError(f"'start' cannot be after 'end'.")
         # make sure all files are under certain subdir.
@@ -207,6 +206,8 @@ class DownloadManager():
         return [sql.export_database(db_filename, table='file') for db_filename in db_filenames]
 
     def list_databases(self):
+        if not os.path.exists(self.database_dir):
+            raise FileNotFoundError(f"Expected directory at {self.database_dir}, found nothing. Perhaps this object has never downloaded anything?")
         return [str(Path(f"{self.database_dir}{f}")) for f in os.listdir(self.database_dir)]
 
 # def download_process_insert(source_filename, local_filename, database_filename, callback, credentials):
@@ -221,14 +222,22 @@ def download_process_insert(args): # args = dict(source_filename, local_filename
     Path(buffer_filename).parent.mkdir(exist_ok=True, parents=True)
 
     # download file
-    safe_download_file(source_filename, buffer_filename, credentials=credentials, max_trial=5, http_404_ok=True, exist_ok=False)
-    file_metadata = callback(source_filename, buffer_filename, local_filename)
-    sql.safe_insert(db_filename=database_filename, table='file', data=file_metadata.to_dict())
+    flag = safe_download_file(source_filename, buffer_filename, credentials=credentials, max_trial=5, http_404_ok=True, exist_ok=False)
+    if flag:
+        # callback and safe_insert should only happen when files are downloaded successfully.
+        file_metadata = callback(source_filename, buffer_filename, local_filename)
+        sql.safe_insert(db_filename=database_filename, table='file', data=file_metadata.to_dict())
 
 
 def safe_download_file(source_filename, dest_filename, credentials=None, max_trial=5, http_404_ok=True, exist_ok=False):
     """Calls download_file() with tolerance (max_trial - many times) in case error occurs.
     To handle incomplete download after process terminated unexpectedly, files are named '---.partial_'. Once download completes it is renamed.
+    Returns:
+        True: if file is downloaded successfully.
+        False: if file is not downloaded but no exception is raised either. This happens if:
+            1. The destination file already exists and exist_ok=True (not recommended)
+            2. source_filename does not exist.
+
     Raises exception in two possible scenarios:
         1) FileNotFoundError() in case the source_filename returns 404 error.
         2) MaximumTrialExceededError() in case any other exceptions have been risen for more than max_trial times.
@@ -237,19 +246,19 @@ def safe_download_file(source_filename, dest_filename, credentials=None, max_tri
         if not exist_ok:
             raise FileExistsError(f'File already exists: {dest_filename}')
         logging.warning('exist_ok=True is not recommended. File already exists.')
-        return
+        return False
     for trial in range(max_trial):
         try:
             # To handle abrupt download interruption, temporarily save file as '.partial_' and rename once download completes.
             download_file(source_filename=source_filename, dest_filename=f"{dest_filename}.partial_", credentials=credentials)
             os.replace(f"{dest_filename}.partial_", dest_filename)
-            return # exit if successful.
+            return True# exit if successful.
         except Exception as e:
             # Check for HTTP 404 status
             if (str(e) == 'HTTP Error 404 Not Found') or (str(e) == 'HTTP Error 404: Not Found'):
                 if http_404_ok:
                     logging.warning(f"{source_filename} does not exist.")
-                    return # Simply exit the function. This is expected for live HRRR and GFS download.
+                    return False# Simply exit the function. This is expected for live HRRR and GFS download.
                 else:
                     raise FileNotFoundError(f"{source_filename} does not exist.") #If 404, no point in trying again. Simply raise Exception.
             
